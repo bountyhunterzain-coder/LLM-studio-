@@ -1,0 +1,412 @@
+name: Build LLM Studio APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Find and extract ZIP
+        run: |
+          echo "=== Files in repo ==="
+          ls -la
+          
+          # Find any zip file
+          ZIP=$(find . -name "*.zip" | head -1)
+          echo "Found zip: $ZIP"
+          
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No zip file found!"
+            exit 1
+          fi
+          
+          # Extract zip
+          unzip -o "$ZIP" -d extracted/
+          echo "=== Extracted contents ==="
+          find extracted/ -type f | head -30
+
+      - name: Setup project structure
+        run: |
+          # Find the project root (where build.gradle.kts or settings.gradle.kts is)
+          PROJECT_ROOT=$(find extracted/ -name "settings.gradle.kts" -o -name "settings.gradle" | head -1 | xargs dirname 2>/dev/null)
+          
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "Looking deeper..."
+            PROJECT_ROOT=$(find extracted/ -name "gradlew" | head -1 | xargs dirname 2>/dev/null)
+          fi
+          
+          echo "Project root found: $PROJECT_ROOT"
+          
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "=== Creating project from scratch ==="
+            
+            # Create complete project structure manually
+            mkdir -p project/app/src/main/java/com/example/{data,ui/{screens/{chat,home,terminal,models,settings},theme},utils}
+            mkdir -p project/app/src/main/res/{values,xml,mipmap-hdpi,mipmap-xhdpi,mipmap-xxhdpi,mipmap-xxxhdpi,mipmap-anydpi-v26}
+            mkdir -p project/gradle/wrapper
+            mkdir -p project/.github/workflows
+            
+            # Copy all .kt files from extracted
+            find extracted/ -name "*.kt" | while read f; do
+              fname=$(basename "$f")
+              # Determine destination based on filename
+              case "$fname" in
+                Color.kt|Theme.kt|Type.kt) dest="project/app/src/main/java/com/example/ui/theme/$fname" ;;
+                MainActivity.kt) dest="project/app/src/main/java/com/example/$fname" ;;
+                MainAppScreen.kt) dest="project/app/src/main/java/com/example/ui/$fname" ;;
+                ChatScreen.kt) dest="project/app/src/main/java/com/example/ui/screens/chat/$fname" ;;
+                HomeScreen.kt) dest="project/app/src/main/java/com/example/ui/screens/home/$fname" ;;
+                TerminalScreen.kt) dest="project/app/src/main/java/com/example/ui/screens/terminal/$fname" ;;
+                ModelsScreen.kt) dest="project/app/src/main/java/com/example/ui/screens/models/$fname" ;;
+                SettingsScreen.kt) dest="project/app/src/main/java/com/example/ui/screens/settings/$fname" ;;
+                GeminiApi.kt|AppDatabase.kt|ChatDao.kt|Entities.kt|SettingsDataStore.kt) dest="project/app/src/main/java/com/example/data/$fname" ;;
+                ZipExporter.kt) dest="project/app/src/main/java/com/example/utils/$fname" ;;
+                *) dest="project/app/src/main/java/com/example/$fname" ;;
+              esac
+              mkdir -p "$(dirname $dest)"
+              cp "$f" "$dest"
+              echo "Copied: $fname → $dest"
+            done
+            
+            PROJECT_ROOT="project"
+          else
+            cp -r "$PROJECT_ROOT" project/
+            PROJECT_ROOT="project"
+          fi
+          
+          # Fix missing 'src' directory structure if the zip contains 'app/main' instead of 'app/src/main'
+          if [ -d "project/app/main" ] && [ ! -d "project/app/src/main" ]; then
+            echo "=== Fixing missing 'src' directory structure ==="
+            mkdir -p project/app/src
+            mv project/app/main project/app/src/main
+          fi
+          
+          # Clean up any corrupted empty directories with brace expansion typos like {data,ui}
+          find project/ -name "*{*" -o -name "*}*" -exec rm -rf {} + 2>/dev/null || true
+          
+          echo "PROJECT_ROOT=project" >> $GITHUB_ENV
+
+      - name: Create missing project files
+        run: |
+          cd project
+          
+          # settings.gradle.kts
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+          cat > settings.gradle.kts << 'SETTINGS'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              versionCatalogs {
+                  create("libs") { from(files("gradle/libs.versions.toml")) }
+              }
+          }
+          rootProject.name = "LLMStudio"
+          include(":app")
+          SETTINGS
+          echo "Created settings.gradle.kts"
+          fi
+          
+          # Root build.gradle.kts
+          if [ ! -f build.gradle.kts ] && [ ! -f build.gradle ]; then
+          cat > build.gradle.kts << 'ROOTBUILD'
+          plugins {
+              alias(libs.plugins.android.application)  apply false
+              alias(libs.plugins.kotlin.android)       apply false
+              alias(libs.plugins.kotlin.compose)       apply false
+              alias(libs.plugins.kotlin.serialization) apply false
+              alias(libs.plugins.google.devtools.ksp)  apply false
+          }
+          ROOTBUILD
+          echo "Created root build.gradle.kts"
+          fi
+          
+          # gradle.properties
+          if [ ! -f gradle.properties ]; then
+          cat > gradle.properties << 'PROPS'
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          PROPS
+          echo "Created gradle.properties"
+          fi
+
+      - name: Create libs.versions.toml
+        run: |
+          cd project
+          if [ -f gradle/libs.versions.toml ]; then
+            echo "libs.versions.toml already exists, skipping creation."
+            exit 0
+          fi
+          
+          mkdir -p gradle
+          cat > gradle/libs.versions.toml << 'TOML'
+          [versions]
+          agp                         = "8.7.3"
+          kotlin                      = "2.1.0"
+          ksp                         = "2.1.0-1.0.29"
+          coreKtx                     = "1.15.0"
+          lifecycleRuntimeKtx         = "2.8.7"
+          activityCompose             = "1.10.1"
+          composeBom                  = "2024.12.01"
+          navigationCompose           = "2.8.5"
+          room                        = "2.6.1"
+          datastore                   = "1.1.1"
+          retrofit                    = "2.11.0"
+          retrofitKotlinxSerializer   = "1.0.0"
+          okhttp                      = "4.12.0"
+          kotlinxSerialization        = "1.7.3"
+          kotlinxCoroutines           = "1.9.0"
+          lifecycleViewmodelCompose   = "2.8.7"
+          materialIconsExtended       = "1.7.6"
+
+          [libraries]
+          androidx-core-ktx                        = { group = "androidx.core",                  name = "core-ktx",                              version.ref = "coreKtx" }
+          androidx-lifecycle-runtime-ktx           = { group = "androidx.lifecycle",             name = "lifecycle-runtime-ktx",                 version.ref = "lifecycleRuntimeKtx" }
+          androidx-lifecycle-viewmodel-compose     = { group = "androidx.lifecycle",             name = "lifecycle-viewmodel-compose",           version.ref = "lifecycleViewmodelCompose" }
+          androidx-activity-compose                = { group = "androidx.activity",              name = "activity-compose",                      version.ref = "activityCompose" }
+          androidx-compose-bom                     = { group = "androidx.compose",               name = "compose-bom",                           version.ref = "composeBom" }
+          androidx-ui                              = { group = "androidx.compose.ui",            name = "ui" }
+          androidx-ui-graphics                     = { group = "androidx.compose.ui",            name = "ui-graphics" }
+          androidx-ui-tooling                      = { group = "androidx.compose.ui",            name = "ui-tooling" }
+          androidx-ui-tooling-preview              = { group = "androidx.compose.ui",            name = "ui-tooling-preview" }
+          androidx-ui-test-manifest                = { group = "androidx.compose.ui",            name = "ui-test-manifest" }
+          androidx-material3                       = { group = "androidx.compose.material3",     name = "material3" }
+          androidx-material-icons-extended         = { group = "androidx.compose.material",      name = "material-icons-extended",               version.ref = "materialIconsExtended" }
+          androidx-navigation-compose              = { group = "androidx.navigation",            name = "navigation-compose",                    version.ref = "navigationCompose" }
+          androidx-room-runtime                    = { group = "androidx.room",                  name = "room-runtime",                          version.ref = "room" }
+          androidx-room-ktx                        = { group = "androidx.room",                  name = "room-ktx",                              version.ref = "room" }
+          androidx-room-compiler                   = { group = "androidx.room",                  name = "room-compiler",                         version.ref = "room" }
+          androidx-datastore-preferences           = { group = "androidx.datastore",             name = "datastore-preferences",                 version.ref = "datastore" }
+          kotlinx-serialization-json               = { group = "org.jetbrains.kotlinx",          name = "kotlinx-serialization-json",            version.ref = "kotlinxSerialization" }
+          kotlinx-coroutines-android               = { group = "org.jetbrains.kotlinx",          name = "kotlinx-coroutines-android",            version.ref = "kotlinxCoroutines" }
+          retrofit                                 = { group = "com.squareup.retrofit2",          name = "retrofit",                              version.ref = "retrofit" }
+          retrofit-kotlinx-serialization-converter = { group = "com.jakewharton.retrofit",       name = "retrofit2-kotlinx-serialization-converter", version.ref = "retrofitKotlinxSerializer" }
+          okhttp                                   = { group = "com.squareup.okhttp3",           name = "okhttp",                                version.ref = "okhttp" }
+          okhttp-logging                           = { group = "com.squareup.okhttp3",           name = "logging-interceptor",                   version.ref = "okhttp" }
+
+          [plugins]
+          android-application         = { id = "com.android.application",                 version.ref = "agp" }
+          kotlin-android              = { id = "org.jetbrains.kotlin.android",            version.ref = "kotlin" }
+          kotlin-compose              = { id = "org.jetbrains.kotlin.plugin.compose",     version.ref = "kotlin" }
+          kotlin-serialization        = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+          google-devtools-ksp         = { id = "com.google.devtools.ksp",                 version.ref = "ksp" }
+          TOML
+          echo "Created libs.versions.toml"
+
+      - name: Create app/build.gradle.kts if missing
+        run: |
+          cd project
+          if [ ! -f app/build.gradle.kts ] && [ ! -f app/build.gradle ]; then
+          mkdir -p app
+          cat > app/build.gradle.kts << 'APPBUILD'
+          plugins {
+              alias(libs.plugins.android.application)
+              alias(libs.plugins.kotlin.android)
+              alias(libs.plugins.kotlin.compose)
+              alias(libs.plugins.kotlin.serialization)
+              alias(libs.plugins.google.devtools.ksp)
+          }
+          android {
+              namespace   = "com.example"
+              compileSdk  = 35
+              defaultConfig {
+                  applicationId = "com.example.llmstudio"
+                  minSdk        = 26
+                  targetSdk     = 35
+                  versionCode   = 1
+                  versionName   = "1.0.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging {
+                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+              }
+          }
+          dependencies {
+              implementation(platform(libs.androidx.compose.bom))
+              implementation(libs.androidx.ui)
+              implementation(libs.androidx.ui.graphics)
+              implementation(libs.androidx.ui.tooling.preview)
+              implementation(libs.androidx.material3)
+              implementation(libs.androidx.material.icons.extended)
+              implementation(libs.androidx.core.ktx)
+              implementation(libs.androidx.lifecycle.runtime.ktx)
+              implementation(libs.androidx.activity.compose)
+              implementation(libs.androidx.lifecycle.viewmodel.compose)
+              implementation(libs.androidx.navigation.compose)
+              implementation(libs.androidx.room.runtime)
+              implementation(libs.androidx.room.ktx)
+              ksp(libs.androidx.room.compiler)
+              implementation(libs.androidx.datastore.preferences)
+              implementation(libs.kotlinx.serialization.json)
+              implementation(libs.retrofit)
+              implementation(libs.retrofit.kotlinx.serialization.converter)
+              implementation(libs.okhttp)
+              implementation(libs.okhttp.logging)
+              implementation(libs.kotlinx.coroutines.android)
+              debugImplementation(libs.androidx.ui.tooling)
+          }
+          APPBUILD
+          echo "Created app/build.gradle.kts"
+          fi
+
+      - name: Create AndroidManifest if missing
+        run: |
+          cd project
+          MANIFEST=$(find app/src -name "AndroidManifest.xml" | head -1)
+          if [ -z "$MANIFEST" ]; then
+            mkdir -p app/src/main
+            cat > app/src/main/AndroidManifest.xml << 'MANIFEST'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="LLM Studio"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.App"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:theme="@style/Theme.App">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          MANIFEST
+            echo "Created AndroidManifest.xml"
+          fi
+
+      - name: Create minimal res files if missing
+        run: |
+          cd project
+          mkdir -p app/src/main/res/{values,xml}
+          
+          if [ ! -f app/src/main/res/values/strings.xml ]; then
+          cat > app/src/main/res/values/strings.xml << 'XML'
+          <resources><string name="app_name">LLM Studio</string></resources>
+          XML
+          fi
+          
+          if [ ! -f app/src/main/res/values/themes.xml ]; then
+          cat > app/src/main/res/values/themes.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.App" parent="android:Theme.Material.Light.NoActionBar" />
+              <style name="Theme.MyApplication" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          XML
+          fi
+
+          if [ ! -f app/src/main/res/xml/backup_rules.xml ]; then
+          cat > app/src/main/res/xml/backup_rules.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?><full-backup-content />
+          XML
+          fi
+          
+          if [ ! -f app/src/main/res/xml/data_extraction_rules.xml ]; then
+          cat > app/src/main/res/xml/data_extraction_rules.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?><data-extraction-rules><cloud-backup /><device-transfer /></data-extraction-rules>
+          XML
+          fi
+
+      - name: Download Gradle Wrapper JAR
+        run: |
+          cd project
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            echo "Gradle wrapper already exists, preserving original wrapper config."
+            chmod +x gradlew || true
+            exit 0
+          fi
+          
+          echo "Gradle wrapper missing, downloading wrapper version 8.9.0..."
+          mkdir -p gradle/wrapper
+          curl -L -o gradle/wrapper/gradle-wrapper.jar \
+            "https://github.com/gradle/gradle/raw/v8.9.0/gradle/wrapper/gradle-wrapper.jar"
+          
+          cat > gradle/wrapper/gradle-wrapper.properties << 'PROPS'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-bin.zip
+          networkTimeout=10000
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          PROPS
+          
+          # Create gradlew
+          cat > gradlew << 'GRADLEW'
+          #!/bin/sh
+          CLASSPATH="${0%/*}/gradle/wrapper/gradle-wrapper.jar"
+          exec java -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+          GRADLEW
+          chmod +x gradlew
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Show project structure before build
+        run: |
+          cd project
+          echo "=== Final project structure ==="
+          find . -not -path "./.gradle/*" -not -path "./build/*" -type f | sort
+
+      - name: Build Debug APK
+        run: |
+          cd project
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLM-Studio-APK
+          path: project/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Success message
+        run: echo "✅ APK ready! Download from Artifacts section above."
